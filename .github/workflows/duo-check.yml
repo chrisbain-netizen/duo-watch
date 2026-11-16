@@ -2,7 +2,7 @@ name: iPhone Duo check
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # GitHub may delay runs by several minutes
+    - cron: "4,19,34,49 * * * *"   # GitHub may delay runs by several minutes
   workflow_dispatch:
     inputs:
       test_push:
