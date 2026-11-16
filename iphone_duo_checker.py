@@ -51,6 +51,12 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
+# Send a "bot is failing" alert after this many failed checks in a row
+# (3 checks is roughly 45 minutes at a 15-minute schedule).
+FAILURE_ALERT_AFTER = 3
+
+APPLE_BUY_URL = "https://www.apple.com/shop/buy-iphone/iphone-duo"
+
 CHECK_INTERVAL_SECONDS = 15 * 60  # every 15 minutes
 STATE_FILE = Path(__file__).with_name("iphone_duo_state.json")
 # -----------------------------------------------------------------------------
@@ -95,17 +101,27 @@ def fetch_stores(part):
 
 
 def check_once():
-    """Return {store_key: {...}} for every in-range store with stock right now."""
+    """Return (in_stock, errors).
+
+    in_stock: {store_key: {...}} for every in-range store with stock right now.
+    errors:   list of problems; non-empty means this check could not be trusted.
+    """
     in_stock = {}
+    errors = []
     for part, label in PART_NUMBERS.items():
         try:
             stores = fetch_stores(part)
-        except Exception as e:  # network, JSON shape change, rate limit, etc.
+        except Exception as e:  # network, blocked by Apple, JSON shape change, etc.
+            msg = f"{label}: {type(e).__name__}: {e}"
             log(f"ERROR checking {part}: {e}")
+            errors.append(msg)
             continue
 
         if not stores:
-            log(f"{label}: no stores returned (bad part number or Apple changed the API?)")
+            msg = f"{label}: Apple returned no stores (bad part number or API changed?)"
+            log(msg)
+            errors.append(msg)
+            continue
 
         for s in stores:
             miles = parse_miles(s)
@@ -123,17 +139,18 @@ def check_once():
                     "label": label,
                     "pickup": avail.get("pickupSearchQuote", "Available"),
                 }
-    return in_stock
+    return in_stock, errors
 
 
-def send_email(title, body):
+def send_email(title, body, link=True):
     if not (SMTP_USER and SMTP_PASSWORD and EMAIL_TO):
         return  # email is optional; set SMTP_USER, SMTP_PASSWORD and EMAIL_TO to enable
     msg = EmailMessage()
     msg["Subject"] = title
     msg["From"] = SMTP_USER
     msg["To"] = EMAIL_TO
-    msg.set_content(body + "\n\nBuy/reserve: https://www.apple.com/shop/buy-iphone/iphone-duo")
+    footer = "\n\nBuy/reserve: https://www.apple.com/shop/buy-iphone/iphone-duo" if link else ""
+    msg.set_content(body + footer)
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
             smtp.login(SMTP_USER, SMTP_PASSWORD)
@@ -143,19 +160,18 @@ def send_email(title, body):
         log(f"Email failed: {e}")
 
 
-def notify(title, body):
+def notify(title, body, priority="urgent", click=APPLE_BUY_URL):
     log(f"ALERT: {title}\n{body}")
-    send_email(title, body)
+    send_email(title, body, link=bool(click))
     if NTFY_TOPIC:
+        headers = {"Title": title, "Priority": priority}
+        if click:
+            headers["Click"] = click
         try:
             requests.post(
                 f"https://ntfy.sh/{NTFY_TOPIC}",
                 data=body.encode("utf-8"),
-                headers={
-                    "Title": title,
-                    "Priority": "urgent",
-                    "Click": "https://www.apple.com/shop/buy-iphone/iphone-duo",
-                },
+                headers=headers,
                 timeout=15,
             )
         except Exception as e:
@@ -163,21 +179,55 @@ def notify(title, body):
 
 
 def load_state():
+    """State: stores already alerted on, plus a consecutive-failure counter."""
+    state = {"in_stock": [], "failures": 0, "failure_alerted": False}
     try:
-        return set(json.loads(STATE_FILE.read_text()))
+        raw = json.loads(STATE_FILE.read_text())
+        if isinstance(raw, list):  # older state-file format
+            state["in_stock"] = raw
+        elif isinstance(raw, dict):
+            state.update(raw)
     except Exception:
-        return set()
+        pass
+    return state
 
 
-def save_state(keys):
-    STATE_FILE.write_text(json.dumps(sorted(keys)))
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state))
 
 
 def run():
-    previous = load_state()
-    current = check_once()
-    new_keys = set(current) - previous
+    state = load_state()
+    current, errors = check_once()
 
+    if errors:
+        # Keep the old in_stock list so we don't re-alert when things recover.
+        state["failures"] += 1
+        log(f"Check failed ({state['failures']} in a row).")
+        if state["failures"] >= FAILURE_ALERT_AFTER and not state["failure_alerted"]:
+            notify(
+                "iPhone Duo bot is having problems",
+                f"{state['failures']} checks in a row failed, so you may miss restocks.\n"
+                + "\n".join(errors[:3]),
+                priority="high",
+                click=None,
+            )
+            state["failure_alerted"] = True
+        save_state(state)
+        return
+
+    # Healthy check
+    if state["failure_alerted"]:
+        notify(
+            "iPhone Duo bot is working again",
+            "Checks are succeeding again.",
+            priority="default",
+            click=None,
+        )
+    state["failures"] = 0
+    state["failure_alerted"] = False
+
+    new_keys = set(current) - set(state["in_stock"])
     if new_keys:
         lines = [
             f"- {current[k]['label']} at {current[k]['store']} "
@@ -193,7 +243,8 @@ def run():
         )
 
     # Saving the current set means a store that sells out and restocks alerts again.
-    save_state(set(current))
+    state["in_stock"] = sorted(current)
+    save_state(state)
 
 
 def main():
